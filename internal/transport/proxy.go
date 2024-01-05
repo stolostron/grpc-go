@@ -21,6 +21,8 @@ package transport
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -28,9 +30,14 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 )
 
 const proxyAuthHeaderKey = "Proxy-Authorization"
+
+// rootCaEnvironmentVar is an environment variable to specify the root ca cert file.
+const rootCaEnvironmentVar = "ROOT_CA_CERT"
 
 var (
 	// The following variable will be overwritten in the tests.
@@ -118,13 +125,36 @@ func proxyDial(ctx context.Context, addr string, grpcUA string) (conn net.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	if proxyURL != nil {
-		newAddr = proxyURL.Host
+
+	if proxyURL == nil {
+		// proxy is disabled if proxyURL is nil.
+		return (&net.Dialer{}).DialContext(ctx, "tcp", newAddr)
 	}
 
-	conn, err = (&net.Dialer{}).DialContext(ctx, "tcp", newAddr)
-	if err != nil {
-		return
+	newAddr = proxyURL.Host
+	if proxyURL.Scheme == "https" {
+		conf := &tls.Config{
+			InsecureSkipVerify: true,
+		}
+
+		caCert, err := getCACertPool()
+		if err != nil {
+			return nil, err
+		}
+		if caCert != nil {
+			conf.InsecureSkipVerify = false
+			conf.RootCAs = caCert
+		}
+
+		conn, err = tls.Dial("tcp", newAddr, conf)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		conn, err = (&net.Dialer{}).DialContext(ctx, "tcp", newAddr)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if proxyURL != nil {
 		// proxy is disabled if proxyURL is nil.
@@ -139,4 +169,26 @@ func sendHTTPRequest(ctx context.Context, req *http.Request, conn net.Conn) erro
 		return fmt.Errorf("failed to write the HTTP request: %v", err)
 	}
 	return nil
+}
+
+// getCACertPool loads CA certificates to pool
+func getCACertPool() (*x509.CertPool, error) {
+	caFile := getRootCaFromEnvironment()
+	if caFile == "" {
+		return nil, nil
+	}
+	certPool := x509.NewCertPool()
+	caCert, err := os.ReadFile(filepath.Clean(caFile))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA cert %s: %v", caFile, err)
+	}
+	ok := certPool.AppendCertsFromPEM(caCert)
+	if !ok {
+		return nil, fmt.Errorf("failed to append CA cert to the cert pool")
+	}
+	return certPool, nil
+}
+
+func getRootCaFromEnvironment() string {
+	return os.Getenv(rootCaEnvironmentVar)
 }

@@ -24,7 +24,15 @@ package proxyserver
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"testing"
@@ -131,4 +139,83 @@ func New(t *testing.T, reqCheck func(*http.Request), waitForServerHello bool) *P
 	t.Logf("Started proxy at: %q", pLis.Addr().String())
 	t.Cleanup(p.stop)
 	return p
+}
+
+// NewTLS initializes and starts a TLS-enabled proxy server. It generates a
+// self-signed certificate for the proxy and returns the ProxyServer along
+// with the PEM-encoded CA certificate bytes that clients should use to
+// verify the proxy's TLS certificate.
+func NewTLS(t *testing.T, reqCheck func(*http.Request), waitForServerHello bool) (*ProxyServer, []byte) {
+	t.Helper()
+	pLis, err := testutils.LocalTCPListener()
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	// Generate a self-signed CA and server certificate for the proxy.
+	tlsCert, caCertPEM := generateSelfSignedCert(t)
+	tlsLis := tls.NewListener(pLis, &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+	})
+
+	p := &ProxyServer{
+		lis:       tlsLis,
+		onRequest: reqCheck,
+		Addr:      pLis.Addr().String(),
+	}
+
+	go func() {
+		for {
+			in, err := p.lis.Accept()
+			if err != nil {
+				return
+			}
+			p.handleRequest(t, in, waitForServerHello)
+		}
+	}()
+	t.Logf("Started TLS proxy at: %q", pLis.Addr().String())
+	t.Cleanup(p.stop)
+	return p, caCertPEM
+}
+
+// generateSelfSignedCert creates a self-signed TLS certificate for testing.
+// Returns the tls.Certificate and the PEM-encoded CA certificate bytes.
+func generateSelfSignedCert(t *testing.T) (tls.Certificate, []byte) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate private key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test-proxy"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.IPv6loopback},
+		DNSNames:     []string{"localhost"},
+		IsCA:         true,
+		BasicConstraintsValid: true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("failed to marshal private key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("failed to load key pair: %v", err)
+	}
+	return tlsCert, certPEM
 }

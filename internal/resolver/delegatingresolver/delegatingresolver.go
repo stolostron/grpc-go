@@ -301,7 +301,19 @@ func (r *delegatingResolver) updateClientConnStateLocked() error {
 	if len(r.proxyAddrs) == 1 {
 		proxyAddr = r.proxyAddrs[0]
 	} else {
-		proxyAddr = resolver.Address{Addr: r.proxyURL.Host}
+		proxyHost := r.proxyURL.Host
+		// When the proxy URL omits the port (e.g. "https://proxy-host"),
+		// url.URL.Host contains only the hostname without a port. Add the
+		// default port based on the scheme so that net.Dial does not fail
+		// with "missing port in address".
+		if _, _, err := net.SplitHostPort(proxyHost); err != nil {
+			defaultPort := "80"
+			if r.proxyURL.Scheme == "https" {
+				defaultPort = "443"
+			}
+			proxyHost = net.JoinHostPort(proxyHost, defaultPort)
+		}
+		proxyAddr = resolver.Address{Addr: proxyHost}
 	}
 	var addresses []resolver.Address
 	for _, targetAddr := range (*r.targetResolverState).Addresses {
@@ -312,6 +324,7 @@ func (r *delegatingResolver) updateClientConnStateLocked() error {
 		addresses = append(addresses, proxyattributes.Set(proxyAddr, proxyattributes.Options{
 			User:        r.proxyURL.User,
 			ConnectAddr: targetAddr.Addr,
+			ProxyScheme: r.proxyURL.Scheme,
 		}))
 	}
 
@@ -331,6 +344,7 @@ func (r *delegatingResolver) updateClientConnStateLocked() error {
 				addrs = append(addrs, proxyattributes.Set(proxyAddr, proxyattributes.Options{
 					User:        r.proxyURL.User,
 					ConnectAddr: targetAddr.Addr,
+					ProxyScheme: r.proxyURL.Scheme,
 				}))
 			}
 		}

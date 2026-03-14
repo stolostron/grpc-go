@@ -21,6 +21,8 @@ package transport
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -28,6 +30,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/proxyattributes"
@@ -35,6 +39,11 @@ import (
 )
 
 const proxyAuthHeaderKey = "Proxy-Authorization"
+
+// proxyCAEnvVar is an environment variable to specify the CA certificate file
+// for verifying TLS connections to HTTPS proxy servers. If not set, the system
+// certificate pool is used.
+const proxyCAEnvVar = "ROOT_CA_CERT"
 
 // To read a response from a net.Conn, http.ReadResponse() takes a bufio.Reader.
 // It's possible that this reader reads more than what's need for the response
@@ -98,13 +107,52 @@ func doHTTPConnectHandshake(ctx context.Context, conn net.Conn, grpcUA string, o
 	return conn, nil
 }
 
-// proxyDial establishes a TCP connection to the specified address and performs an HTTP CONNECT handshake.
+// proxyDial establishes a TCP connection to the specified address and performs
+// an HTTP CONNECT handshake. When the proxy scheme is "https", a TLS
+// connection is established to the proxy server first. The CA certificate for
+// verifying the proxy's TLS certificate can be specified via the
+// ROOT_CA_CERT environment variable; if not set, the system certificate
+// pool is used.
 func proxyDial(ctx context.Context, addr resolver.Address, grpcUA string, opts proxyattributes.Options) (net.Conn, error) {
 	conn, err := internal.NetDialerWithTCPKeepalive().DialContext(ctx, "tcp", addr.Addr)
 	if err != nil {
 		return nil, err
 	}
+
+	if opts.ProxyScheme == "https" {
+		tlsConf, err := proxyTLSConfig(addr.Addr)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		tlsConn := tls.Client(conn, tlsConf)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("TLS handshake to proxy %s failed: %v", addr.Addr, err)
+		}
+		conn = tlsConn
+	}
+
 	return doHTTPConnectHandshake(ctx, conn, grpcUA, opts)
+}
+
+// proxyTLSConfig returns a TLS config for connecting to an HTTPS proxy at the
+// given address. If ROOT_CA_CERT is set, its CA is used for
+// verification. Otherwise, the system certificate pool is used (Go's default
+// behavior when RootCAs is nil).
+func proxyTLSConfig(proxyAddr string) (*tls.Config, error) {
+	// Extract the hostname from the proxy address for SNI/verification.
+	host, _, err := net.SplitHostPort(proxyAddr)
+	if err != nil {
+		host = proxyAddr
+	}
+
+	caCertPool, err := loadProxyCACertPool()
+	if err != nil {
+		return nil, err
+	}
+	// When caCertPool is nil, Go uses the system certificate pool by default.
+	return &tls.Config{ServerName: host, RootCAs: caCertPool}, nil
 }
 
 func sendHTTPRequest(ctx context.Context, req *http.Request, conn net.Conn) error {
@@ -113,4 +161,23 @@ func sendHTTPRequest(ctx context.Context, req *http.Request, conn net.Conn) erro
 		return fmt.Errorf("failed to write the HTTP request: %v", err)
 	}
 	return nil
+}
+
+// loadProxyCACertPool loads the CA certificate specified by the ROOT_CA_CERT
+// environment variable into a certificate pool. Returns (nil, nil) when the
+// environment variable is not set.
+func loadProxyCACertPool() (*x509.CertPool, error) {
+	caFile := os.Getenv(proxyCAEnvVar)
+	if caFile == "" {
+		return nil, nil
+	}
+	certPool := x509.NewCertPool()
+	caCert, err := os.ReadFile(filepath.Clean(caFile))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read proxy CA cert %s: %v", caFile, err)
+	}
+	if ok := certPool.AppendCertsFromPEM(caCert); !ok {
+		return nil, fmt.Errorf("failed to append proxy CA cert to the cert pool")
+	}
+	return certPool, nil
 }

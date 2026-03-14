@@ -35,6 +35,10 @@ const proxyOptionsKey = keyType("grpc.resolver.delegatingresolver.proxyOptions")
 type Options struct {
 	User        *url.Userinfo
 	ConnectAddr string
+	// ProxyScheme is the URL scheme of the proxy, e.g. "http" or "https".
+	// When set to "https", the transport will establish a TLS connection
+	// to the proxy server before performing the HTTP CONNECT handshake.
+	ProxyScheme string
 }
 
 // Set returns a copy of addr with opts set in its attributes.

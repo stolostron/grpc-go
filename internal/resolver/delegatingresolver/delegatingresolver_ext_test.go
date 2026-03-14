@@ -157,10 +157,11 @@ func mustBuildResolver(ctx context.Context, t *testing.T, buildCh chan struct{})
 }
 
 // proxyAddressWithTargetAttribute creates a resolver.Address for the proxy,
-// adding the target address as an attribute.
+// adding the target address as an attribute. The ProxyScheme is set to "https"
+// to match the proxy URL scheme used in these tests.
 func proxyAddressWithTargetAttribute(proxyAddr string, targetAddr string) resolver.Address {
 	addr := resolver.Address{Addr: proxyAddr}
-	addr = proxyattributes.Set(addr, proxyattributes.Options{ConnectAddr: targetAddr})
+	addr = proxyattributes.Set(addr, proxyattributes.Options{ConnectAddr: targetAddr, ProxyScheme: "https"})
 	return addr
 }
 
@@ -570,10 +571,12 @@ func (s) TestDelegatingResolverForMultipleProxyAddress(t *testing.T) {
 		ServiceConfig: &serviceconfig.ParseResult{},
 	})
 
+	// When the proxy URL has no explicit port and scheme is "https", the
+	// delegating resolver appends the default port 443.
 	wantState := resolver.State{
 		Addresses: []resolver.Address{
-			proxyAddressWithTargetAttribute(envProxyAddr, resolvedTargetTestAddr1),
-			proxyAddressWithTargetAttribute(envProxyAddr, resolvedTargetTestAddr2),
+			proxyAddressWithTargetAttribute(envProxyAddr+":443", resolvedTargetTestAddr1),
+			proxyAddressWithTargetAttribute(envProxyAddr+":443", resolvedTargetTestAddr2),
 		},
 		ServiceConfig: &serviceconfig.ParseResult{},
 	}

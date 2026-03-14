@@ -20,12 +20,21 @@ package transport_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -99,7 +108,7 @@ func (s) TestGRPCDialWithProxy(t *testing.T) {
 	hpfe := func(req *http.Request) (*url.URL, error) {
 		if req.URL.Host == unresolvedTargetURI {
 			return &url.URL{
-				Scheme: "https",
+				Scheme: "http",
 				Host:   pAddr,
 			}, nil
 		}
@@ -156,7 +165,7 @@ func (s) TestGRPCDialWithDNSAndProxy(t *testing.T) {
 	hpfe := func(req *http.Request) (*url.URL, error) {
 		if req.URL.Host == unresolvedTargetURI {
 			return &url.URL{
-				Scheme: "https",
+				Scheme: "http",
 				Host:   pServer.Addr,
 			}, nil
 		}
@@ -215,7 +224,7 @@ func (s) TestNewClientWithProxy(t *testing.T) {
 	hpfe := func(req *http.Request) (*url.URL, error) {
 		if req.URL.Host == unresolvedTargetURI {
 			return &url.URL{
-				Scheme: "https",
+				Scheme: "http",
 				Host:   pAddr,
 			}, nil
 		}
@@ -269,7 +278,7 @@ func (s) TestNewClientWithProxyAndCustomResolver(t *testing.T) {
 	hpfe := func(req *http.Request) (*url.URL, error) {
 		if req.URL.Host == unresolvedTargetURI {
 			return &url.URL{
-				Scheme: "https",
+				Scheme: "http",
 				Host:   pServer.Addr,
 			}, nil
 		}
@@ -331,7 +340,7 @@ func (s) TestNewClientWithProxyAndTargetResolutionEnabled(t *testing.T) {
 	hpfe := func(req *http.Request) (*url.URL, error) {
 		if req.URL.Host == unresolvedTargetURI {
 			return &url.URL{
-				Scheme: "https",
+				Scheme: "http",
 				Host:   pServer.Addr,
 			}, nil
 		}
@@ -376,7 +385,7 @@ func (s) TestNewClientWithNoProxy(t *testing.T) {
 	hpfe := func(req *http.Request) (*url.URL, error) {
 		if req.URL.Host == unresolvedTargetURI {
 			return &url.URL{
-				Scheme: "https",
+				Scheme: "http",
 				Host:   pServer.Addr,
 			}, nil
 		}
@@ -421,7 +430,7 @@ func (s) TestNewClientWithContextDialer(t *testing.T) {
 	hpfe := func(req *http.Request) (*url.URL, error) {
 		if req.URL.Host == unresolvedTargetURI {
 			return &url.URL{
-				Scheme: "https",
+				Scheme: "http",
 				Host:   pServer.Addr,
 			}, nil
 		}
@@ -516,4 +525,159 @@ func (s) TestBasicAuthInNewClientWithProxy(t *testing.T) {
 	if !proxyCalled {
 		t.Fatalf("Proxy not connected")
 	}
+}
+
+// Tests the scenario where grpc.NewClient is used with an HTTPS proxy (proxy
+// server itself requires TLS). The test verifies that the client establishes a
+// TLS connection to the proxy, performs the HTTP CONNECT handshake over TLS,
+// and successfully connects to the backend server. The ROOT_CA_CERT
+// environment variable is used to specify the CA certificate for verifying
+// the proxy's TLS certificate.
+func (s) TestNewClientWithHTTPSProxy(t *testing.T) {
+	backend := startBackendServer(t)
+	unresolvedTargetURI := fmt.Sprintf("localhost:%d", testutils.ParsePort(t, backend.Address))
+	proxyCalled := false
+	reqCheck := func(req *http.Request) {
+		proxyCalled = true
+		host, _, err := net.SplitHostPort(req.URL.Host)
+		if err != nil {
+			t.Error(err)
+		}
+		if got, want := host, "localhost"; got != want {
+			t.Errorf("Unexpected request host: %s, want = %s", got, want)
+		}
+	}
+	pServer, caCertPEM := proxyserver.NewTLS(t, reqCheck, false)
+
+	// Write the CA cert to a temp file for ROOT_CA_CERT.
+	caFile := filepath.Join(t.TempDir(), "proxy-ca.crt")
+	if err := os.WriteFile(caFile, caCertPEM, 0600); err != nil {
+		t.Fatalf("failed to write CA cert file: %v", err)
+	}
+	t.Setenv("ROOT_CA_CERT", caFile)
+
+	pAddr := fmt.Sprintf("localhost:%d", testutils.ParsePort(t, pServer.Addr))
+
+	// Override proxy resolution to return an https scheme URL.
+	orighpfe := delegatingresolver.HTTPSProxyFromEnvironment
+	delegatingresolver.HTTPSProxyFromEnvironment = func(req *http.Request) (*url.URL, error) {
+		if req.URL.Host == unresolvedTargetURI {
+			return &url.URL{
+				Scheme: "https",
+				Host:   pAddr,
+			}, nil
+		}
+		t.Errorf("Unexpected request host to proxy: %s want %s", req.URL.Host, unresolvedTargetURI)
+		return nil, nil
+	}
+	defer func() { delegatingresolver.HTTPSProxyFromEnvironment = orighpfe }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	conn, err := grpc.NewClient(unresolvedTargetURI, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient(%s) failed: %v", unresolvedTargetURI, err)
+	}
+	defer conn.Close()
+
+	// Send an empty RPC to the backend through the HTTPS proxy.
+	client2 := testgrpc.NewTestServiceClient(conn)
+	if _, err := client2.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+		t.Fatalf("EmptyCall failed: %v", err)
+	}
+
+	if !proxyCalled {
+		t.Fatalf("HTTPS Proxy not connected")
+	}
+}
+
+// Tests the scenario where grpc.NewClient is used with an HTTPS proxy that
+// has a self-signed certificate, but no ROOT_CA_CERT is set. The TLS
+// handshake to the proxy should fail because the proxy's cert is not trusted
+// by the system certificate pool.
+func (s) TestNewClientWithHTTPSProxyNoCACert(t *testing.T) {
+	backend := startBackendServer(t)
+	unresolvedTargetURI := fmt.Sprintf("localhost:%d", testutils.ParsePort(t, backend.Address))
+
+	// Create a minimal TLS listener with a self-signed certificate. We don't
+	// use proxyserver.NewTLS here because its handleRequest calls t.Errorf
+	// when it fails to read the CONNECT request, which is the expected
+	// behavior in this negative test (TLS handshake fails).
+	pLis, err := testutils.LocalTCPListener()
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer pLis.Close()
+	key, kerr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if kerr != nil {
+		t.Fatalf("failed to generate key: %v", kerr)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.IPv6loopback},
+		DNSNames:     []string{"localhost"},
+	}
+	certDER, cerr := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if cerr != nil {
+		t.Fatalf("failed to create cert: %v", cerr)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, merr := x509.MarshalECPrivateKey(key)
+	if merr != nil {
+		t.Fatalf("failed to marshal key: %v", merr)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	tlsCert, terr := tls.X509KeyPair(certPEM, keyPEM)
+	if terr != nil {
+		t.Fatalf("failed to load key pair: %v", terr)
+	}
+
+	tlsLis := tls.NewListener(pLis, &tls.Config{Certificates: []tls.Certificate{tlsCert}})
+	go func() {
+		for {
+			conn, err := tlsLis.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	t.Cleanup(func() { tlsLis.Close() })
+
+	pAddr := fmt.Sprintf("localhost:%d", testutils.ParsePort(t, pLis.Addr().String()))
+
+	// Ensure ROOT_CA_CERT is not set; system CAs won't trust self-signed cert.
+	t.Setenv("ROOT_CA_CERT", "")
+
+	// Override proxy resolution to return an https scheme URL.
+	orighpfe := delegatingresolver.HTTPSProxyFromEnvironment
+	delegatingresolver.HTTPSProxyFromEnvironment = func(req *http.Request) (*url.URL, error) {
+		if req.URL.Host == unresolvedTargetURI {
+			return &url.URL{
+				Scheme: "https",
+				Host:   pAddr,
+			}, nil
+		}
+		return nil, nil
+	}
+	defer func() { delegatingresolver.HTTPSProxyFromEnvironment = orighpfe }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := grpc.NewClient(unresolvedTargetURI, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient(%s) failed: %v", unresolvedTargetURI, err)
+	}
+	defer conn.Close()
+
+	// The RPC should fail because the TLS handshake to the proxy fails
+	// (self-signed cert not trusted by system CAs).
+	client2 := testgrpc.NewTestServiceClient(conn)
+	_, err = client2.EmptyCall(ctx, &testpb.Empty{})
+	if err == nil {
+		t.Fatal("EmptyCall should have failed due to TLS verification error, but succeeded")
+	}
+	t.Logf("Expected TLS error: %v", err)
 }

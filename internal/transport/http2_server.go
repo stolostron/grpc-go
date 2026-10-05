@@ -495,8 +495,6 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 
 	// "If :authority is missing, Host must be renamed to :authority." - A41
 	if len(mdata[":authority"]) == 0 {
-		// No-op if host isn't present, no eventual :authority header is a valid
-		// RPC.
 		if host, ok := mdata["host"]; ok {
 			mdata[":authority"] = host
 			delete(mdata, "host")
@@ -504,6 +502,20 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	} else {
 		// "If :authority is present, Host must be discarded" - A41
 		delete(mdata, "host")
+	}
+
+	// If :authority is still missing, no host or :authority header is present.
+	// Reject the request so xDS routing cannot index an empty authority slice.
+	// Fixes CVE-2026-84445.
+	if len(mdata[":authority"]) == 0 {
+		t.controlBuf.put(&earlyAbortStream{
+			httpStatus:     http.StatusBadRequest,
+			streamID:       streamID,
+			contentSubtype: s.contentSubtype,
+			status:         status.New(codes.Internal, "no host or :authority header present"),
+			rst:            !frame.StreamEnded(),
+		})
+		return nil
 	}
 
 	if frame.StreamEnded() {

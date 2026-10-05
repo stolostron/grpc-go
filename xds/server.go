@@ -265,8 +265,12 @@ func routeAndProcess(ctx context.Context) error {
 	}
 	// A41 added logic to the core grpc implementation to guarantee that once
 	// the RPC gets to this point, there will be a single, unambiguous authority
-	// present in the header map.
+	// present in the header map. Reject a missing authority instead of indexing
+	// an empty slice. Fixes CVE-2026-84445.
 	authority := md.Get(":authority")
+	if len(authority) == 0 {
+		return status.Error(codes.Internal, "no :authority header present")
+	}
 	vh := xdsresource.FindBestMatchingVirtualHostServer(authority[0], rc.VHS)
 	if vh == nil {
 		return status.Error(codes.Unavailable, "the incoming RPC did not match a configured Virtual Host")
